@@ -1,0 +1,5 @@
+The exercise requested to:
+"Write a python or bash script that takes three parameters, two strings and a directory name, and substitutes any occurrence of the first string with the second string for any file in the directory, recursively"
+
+To accomplish this task I've written a python script with a main function that use 3 arguments: the directory name, the first string and the second string.
+To gather the arguments I decided to use argsparse in order to provide also an help for the arguments used if needed. The function then use this 3 arguments to recursively check the files in the directory and sub-directories (calling the function back when a directory is found) and rename the file where it matches string1 argument and replaces it with string2.

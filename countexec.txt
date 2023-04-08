@@ -1,0 +1,14 @@
+The exercise requested to:
+"Write a python or bash script that counts the number of script files in a directory subdividing it by the shebang interpreter.
+
+An example output in macOS is:
+countexec /usr/bin
+81 #!/usr/bin/perl
+52 #!/usr/bin/perl5.18
+47 #!/bin/sh
+44 #!/usr/bin/perl5.28
+22 #!/usr/sbin/dtrace -s
+..."
+
+To accomplish this task I've written a python script with a main function that use the directory name as an argument.
+To gather the argument I decided to use argsparse in order to provide also an help for the argument used if needed. The function recursively check the files for non-binary (aka text) files and read the first line and looks for the shabang interpreter [options], add all the results to a defaultdict as key when missing and add a +1 to counter (value) when already present.
