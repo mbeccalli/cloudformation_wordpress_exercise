@@ -29,6 +29,19 @@ Regarding some particular bits from the template:
 
 To run the template, log in into AWS console and go to Cloudformation. Upload the template "CF_Wordpress.yaml" and run it.
 
+### Prerequisites
+
+The account launching the template has to be able to:
+
+- Create VPC in the Region
+- Create Roles for the Lambda trick mentioned before to use the default route of the VPC
+- Create all the networking
+- Create Elastic Load Balancers
+- Create CloudFront Distributions
+- Create the Autoscaling Groups
+
+### Parameters
+
 The parameters requested are:
 
 - VPC CIDR Block
