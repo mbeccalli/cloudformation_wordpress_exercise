@@ -1,0 +1,662 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: AWS CloudFormation WordPress Multi AZ.
+Parameters:
+  VpcCIDR:
+    Description: CIDR block for the VPC
+    Type: String
+    Default: 10.0.0.0/16
+  PublicSubnetCIDR1:
+    Description: CIDR block for the first public subnet
+    Type: String
+    Default: 10.0.1.0/24
+  PublicSubnetCIDR2:
+    Description: CIDR block for the second public subnet
+    Type: String
+    Default: 10.0.2.0/24
+  InstanceType:
+    Description: WebServer EC2 instance type
+    Type: String
+    Default: t2.small
+    AllowedValues:
+      - t1.micro
+      - t2.nano
+      - t2.micro
+      - t2.small
+      - t2.medium
+    ConstraintDescription: must be a valid EC2 instance type.
+  SSHLocation:
+    Description: The IP address range that can be used to SSH to the EC2 instances
+    Type: String
+    MinLength: "9"
+    MaxLength: "18"
+    Default: 0.0.0.0/0
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x.
+  WordpressVersion:
+    Description: The desired version of Wordpress to be installed
+    Type: String
+    Default: "6.2"
+    ConstraintDescription: a valid Wordpres verison must be provided.
+  DBName:
+    Default: wordpressdb
+    Description: The WordPress database name
+    Type: String
+    MinLength: "1"
+    MaxLength: "64"
+    AllowedPattern: "[a-zA-Z][a-zA-Z0-9]*"
+    ConstraintDescription: must begin with a letter and contain only alphanumeric characters.
+  DBUser:
+    NoEcho: "true"
+    Description: The WordPress database admin account username
+    Type: String
+    MinLength: "1"
+    MaxLength: "16"
+    AllowedPattern: "[a-zA-Z][a-zA-Z0-9]*"
+    ConstraintDescription: must begin with a letter and contain only alphanumeric characters.
+  DBPassword:
+    NoEcho: "true"
+    Description: The WordPress database admin account password
+    Type: String
+    MinLength: "8"
+    MaxLength: "41"
+    AllowedPattern: "[a-zA-Z0-9]*"
+    ConstraintDescription: must contain only alphanumeric characters.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VpcCIDR
+          - PublicSubnetCIDR1
+          - PublicSubnetCIDR2
+      - Label:
+          default: "Autoscaling Group Configuration"
+        Parameters:
+          - InstanceType
+          - SSHLocation
+      - Label:
+          default: "Wordpress Configuration"
+        Parameters:
+          - WordpressVersion
+          - DBName
+          - DBUser
+          - DBPassword
+
+Mappings:
+  AWSInstanceType2Arch:
+    t1.micro:
+      Arch: HVM64
+    t2.nano:
+      Arch: HVM64
+    t2.micro:
+      Arch: HVM64
+    t2.small:
+      Arch: HVM64
+    t2.medium:
+      Arch: HVM64
+
+  AWSRegionArch2AMI:
+    eu-west-1:
+      HVM64: ami-015232c01a82b847b
+      HVMG2: ami-0d5299b1c6112c3c7
+    us-east-1:
+      HVM64: ami-032930428bf1abbff
+      HVMG2: ami-0aeb704d503081ea6
+    us-west-1:
+      HVM64: ami-088c153f74339f34c
+      HVMG2: ami-0a7fc72dc0e51aa77
+
+Resources:
+  VpcId:
+    Type: "AWS::EC2::VPC"
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+
+  PublicSubnet1:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      AvailabilityZone: !Select
+        - "0"
+        - !GetAZs
+          Ref: "AWS::Region"
+      CidrBlock: !Ref PublicSubnetCIDR1
+      VpcId: !Ref VpcId
+
+  PublicSubnet2:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      AvailabilityZone: !Select
+        - "1"
+        - !GetAZs
+          Ref: "AWS::Region"
+      CidrBlock: !Ref PublicSubnetCIDR2
+      VpcId: !Ref VpcId
+
+  LambdaIAMRole:
+    Type: "AWS::IAM::Role"
+    DependsOn: VpcId
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "ec2:Describe*"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "arn:aws:logs:*:*:*"
+  LambdaFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaIAMRole.Arn
+      Runtime: python3.9
+      Timeout: 50
+      Code:
+        ZipFile: |
+          from __future__ import print_function
+          import json
+          import boto3
+          import urllib3
+          import cfnresponse
+
+          SUCCESS = "SUCCESS"
+          FAILED = "FAILED"
+
+          http = urllib3.PoolManager()
+
+          print('Loading function')
+          ec2 = boto3.client('ec2')
+
+          def lambda_handler(event, context):
+              print("Received event: " + json.dumps(event, indent=2))
+              responseData={}
+              try:
+                  if event['RequestType'] == 'Delete':
+                      print("Request Type:",event['RequestType'])
+                      print("Delete Request - No Physical resources to delete")
+                  elif event['RequestType'] == 'Create':
+                      print("Request Type:",event['RequestType'])
+                      VPCID=event['ResourceProperties']['VPCID']
+                      RouteTableID=get_vpc(VPCID)
+                      responseData={'RouteTableID':RouteTableID}
+                      print("Sending response to custom resource")
+                  elif event['RequestType'] == 'Update':
+                      print("Request Type:",event['RequestType'])
+                      VPCID=event['ResourceProperties']['VPCID']
+                      RouteTableID=get_vpc(VPCID)
+                      responseData={'RouteTableID':RouteTableID}
+                      print("Sending response to custom resource")
+                  responseStatus = 'SUCCESS'
+                  print("responseStatus: " + responseStatus)
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, "CustomResourcePhysicalID")
+              except Exception as e:
+                  print('Failed to process:', e)
+                  responseStatus = 'FAILURE'
+                  responseData = {'Failure': 'Something bad happened.'}
+                  cfnresponse.send(event, context, cfnresponse.FAILURE, responseData, "CustomResourcePhysicalID")
+
+          def get_vpc(VPCID):
+              response = ec2.describe_route_tables (
+                Filters=[
+                  {
+                    'Name': 'association.main',
+                    'Values': [ 'true' ]
+                  },
+                  {
+                    'Name': 'vpc-id',
+                    'Values': [ VPCID ]
+                  }
+                ]
+              )
+              print("Printing the VPC Route Table ID ....")
+              RouteTableID=response['RouteTables'][0]['RouteTableId']
+              print(RouteTableID)
+              return RouteTableID
+
+          def send(event, context, responseStatus, responseData, physicalResourceId=None, noEcho=False):
+              responseUrl = event['ResponseURL']
+              print(responseUrl)
+              responseBody = {'Status': responseStatus,
+                              'Reason': 'See the details in CloudWatch Log Stream: ' + context.log_stream_name,
+                              'PhysicalResourceId': physicalResourceId or context.log_stream_name,
+                              'StackId': event['StackId'],
+                              'RequestId': event['RequestId'],
+                              'LogicalResourceId': event['LogicalResourceId'],
+                              'Data': responseData}
+              json_responseBody = json.dumps(responseBody)
+              print("Response body:\n" + json_responseBody)
+              headers = {
+                  'content-type' : '',
+                  'content-length' : str(len(json_responseBody))
+              }
+              try:
+                  response = http.request('PUT', responseUrl, headers=headers, body=json_responseBody)
+                  print("Status code: " + response.reason)
+              except Exception as e:
+                  print("send(..) failed executing requests.put(..): " + str(e))
+
+  Lambdatrigger:
+    Type: "Custom::RouteTableLambda"
+    Properties:
+      ServiceToken: !GetAtt LambdaFunction.Arn
+      VPCID: !Ref VpcId
+  InternetGateway:
+    Type: "AWS::EC2::InternetGateway"
+    Properties:
+      Tags:
+        - Key: Env
+          Value: Wordpress
+  AttachGateway:
+    Type: "AWS::EC2::VPCGatewayAttachment"
+    Properties:
+      VpcId: !Ref VpcId
+      InternetGatewayId: !Ref InternetGateway
+  MyRoute:
+    Type: "AWS::EC2::Route"
+    Properties:
+      RouteTableId: !GetAtt Lambdatrigger.RouteTableID
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  ELBSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: Security group for the ELB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  WebServerSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: Enable HTTP access via port 80 locked down to the load balancer + SSH access
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: "80"
+          ToPort: "80"
+          SourceSecurityGroupId: !Select
+            - 0
+            - !GetAtt ElasticLoadBalancer.SecurityGroups
+        - IpProtocol: tcp
+          FromPort: "22"
+          ToPort: "22"
+          CidrIp: !Ref SSHLocation
+      VpcId: !Ref VpcId
+
+  DBEC2SecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: Open database for access
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: "3306"
+          ToPort: "3306"
+          SourceSecurityGroupId: !Ref WebServerSecurityGroup
+      VpcId: !Ref VpcId
+
+  EfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for EFS mount targets
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref WebServerSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocation
+
+  EfsSecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      IpProtocol: tcp
+      FromPort: 2049
+      ToPort: 2049
+      SourceSecurityGroupId: !GetAtt EfsSecurityGroup.GroupId
+      GroupId: !GetAtt EfsSecurityGroup.GroupId
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: "DB Subnet Group for DB Instance"
+      DBSubnetGroupName: !Join ["-", ["db-subnet-group", !Ref VpcId]]
+      SubnetIds:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+
+  ElasticFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: bursting
+
+  ElasticFileSystemMountTarget0:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref ElasticFileSystem
+      SecurityGroups:
+        - !Ref EfsSecurityGroup
+      SubnetId: !Ref PublicSubnet1
+
+  ElasticFileSystemMountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref ElasticFileSystem
+      SecurityGroups:
+        - !Ref EfsSecurityGroup
+      SubnetId: !Ref PublicSubnet2
+
+  ElasticLoadBalancer:
+    Type: "AWS::ElasticLoadBalancingV2::LoadBalancer"
+    DependsOn: AttachGateway
+    Properties:
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ELBSecurityGroup
+
+  ELBListener:
+    Type: "AWS::ElasticLoadBalancingV2::Listener"
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ELBTargetGroup
+      LoadBalancerArn: !Ref ElasticLoadBalancer
+      Port: "80"
+      Protocol: HTTP
+
+  ELBTargetGroup:
+    Type: "AWS::ElasticLoadBalancingV2::TargetGroup"
+    Properties:
+      HealthCheckPath: /wp-admin/install.php
+      HealthCheckIntervalSeconds: 10
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 5
+      VpcId: !Ref VpcId
+      TargetGroupAttributes:
+        - Key: stickiness.enabled
+          Value: "true"
+        - Key: stickiness.type
+          Value: lb_cookie
+        - Key: stickiness.lb_cookie.duration_seconds
+          Value: "30"
+
+  CFDistribution:
+    Type: "AWS::CloudFront::Distribution"
+    Properties:
+      DistributionConfig:
+        Comment: HTTP to HTTPS redirect
+        Enabled: true
+        PriceClass: PriceClass_All
+        HttpVersion: http2
+        IPV6Enabled: false
+        Origins:
+          - Id: ELB
+            DomainName: !GetAtt ElasticLoadBalancer.DNSName
+            CustomOriginConfig:
+              HTTPPort: 80
+              OriginProtocolPolicy: http-only
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+        DefaultCacheBehavior:
+          AllowedMethods:
+            - HEAD
+            - DELETE
+            - POST
+            - GET
+            - OPTIONS
+            - PUT
+            - PATCH
+          CachedMethods:
+            - GET
+            - HEAD
+          Compress: true
+          TargetOriginId: ELB
+          ForwardedValues:
+            QueryString: true
+            Headers:
+              - Host
+              - CloudFront_Forwarded_Proto
+            Cookies:
+              Forward: all
+          ViewerProtocolPolicy: redirect-to-https
+          MinTTL: 0
+
+  KeyPair:
+    Type: "AWS::EC2::KeyPair"
+    Properties:
+      KeyName: !Join ["", ["kp-", !Ref "AWS::StackName"]]
+
+  WebServerGroup:
+    Type: "AWS::AutoScaling::AutoScalingGroup"
+    Properties:
+      VPCZoneIdentifier: [!Ref PublicSubnet1, !Ref PublicSubnet2]
+      LaunchConfigurationName: !Ref LaunchConfig
+      MinSize: "1"
+      MaxSize: "5"
+      DesiredCapacity: "2"
+      TargetGroupARNs:
+        - !Ref ELBTargetGroup
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: "1"
+        MaxBatchSize: "1"
+        PauseTime: PT15M
+        WaitOnResourceSignals: "true"
+
+  LaunchConfig:
+    Type: "AWS::AutoScaling::LaunchConfiguration"
+    Metadata:
+      "AWS::CloudFormation::Init":
+        configSets:
+          wordpress_install:
+            - install_cfn
+            - install_wordpress
+        install_cfn:
+          files:
+            /etc/cfn/cfn-hup.conf:
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+              mode: "000400"
+              owner: root
+              group: root
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.LaunchConfig.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource LaunchConfig --configsets wordpress_install --region ${AWS::Region}
+              mode: "000400"
+              owner: root
+              group: root
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: "true"
+                ensureRunning: "true"
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+        install_wordpress:
+          packages:
+            yum:
+              php73: []
+              php73-mysqlnd: []
+              mysql57: []
+              httpd24: []
+          sources:
+            /var/www/html:
+              !Join [
+                "",
+                [
+                  "http://wordpress.org/wordpress-",
+                  !Ref WordpressVersion,
+                  ".tar.gz",
+                ],
+              ]
+          files:
+            /tmp/config-wordpress:
+              content: !Sub |
+                #!/bin/bash
+                if [ ! -f /var/www/html/completed.txt ]; then
+                  cp /var/www/html/wordpress/wp-config-sample.php /var/www/html/wordpress/wp-config.php
+                  sed -i "s/database_name_here/${DBName}/g" wp-config.php
+                  sed -i "s/username_here/${DBUser}/g" wp-config.php
+                  sed -i "s/password_here/${DBPassword}/g" wp-config.php
+                  sed -i "s/localhost/${DBInstance.Endpoint.Address}/g" wp-config.php
+                  sed -i "15s#.*#*/#" wp-config.php
+                  sed -i "16s#.*#if (\!empty(\$_SERVER['HTTP_X_FORWARDED_PROTO']) \&\& \$_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') {#" wp-config.php
+                  sed -i "17s#.*#       \$_SERVER['HTTPS'] = 'on';#" wp-config.php
+                  sed -i "18s#.*#} elseif (\!empty( \$_SERVER['HTTP_CLOUDFRONT_FORWARDED_PROTO']) \&\& \$_SERVER['HTTP_CLOUDFRONT_FORWARDED_PROTO'] === 'https') {#" wp-config.php
+                  sed -i "19s#.*#       \$_SERVER['HTTPS'] = 'on';}#" wp-config.php
+                  cp -r /var/www/html/wordpress/* /var/www/html/                 
+                  rm -rf /var/www/html/wordpress
+                  touch /var/www/html/completed.txt
+                fi
+                chown -R apache:apache /var/www/html/
+                chmod u+wrx /var/www/html/wp-content/*
+                rm -rf /var/www/html/wordpress
+                service httpd restart
+              mode: "000500"
+              owner: root
+              group: root
+          commands:
+            01_configure_wordpress:
+              command: /tmp/config-wordpress
+              cwd: /var/www/html/wordpress
+          services:
+            sysvinit:
+              httpd:
+                enabled: "true"
+                ensureRunning: "true"
+    Properties:
+      AssociatePublicIpAddress: "true"
+      ImageId: !FindInMap
+        - AWSRegionArch2AMI
+        - !Ref "AWS::Region"
+        - !FindInMap
+          - AWSInstanceType2Arch
+          - !Ref InstanceType
+          - Arch
+      InstanceType: !Ref InstanceType
+      SecurityGroups:
+        - !Ref WebServerSecurityGroup
+      KeyName: !Ref KeyPair
+      UserData:
+        "Fn::Base64": !Sub |
+          #!/bin/bash
+          yum update -y aws-cfn-bootstrap
+          mkdir -p /var/www/html
+          mount -t nfs4 -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2 ${ElasticFileSystem}.efs.${AWS::Region}.amazonaws.com:/ /var/www/html
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource LaunchConfig --configsets wordpress_install --region ${AWS::Region}
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource WebServerGroup --region ${AWS::Region}
+          yum update -y
+
+  ASGScalingPolicyHigh:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref WebServerGroup
+      PolicyType: StepScaling
+      AdjustmentType: ChangeInCapacity
+      StepAdjustments:
+        - MetricIntervalLowerBound: 0
+          ScalingAdjustment: 1
+  ASGScalingPolicyDown:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref WebServerGroup
+      PolicyType: StepScaling
+      AdjustmentType: ChangeInCapacity
+      StepAdjustments:
+        - MetricIntervalLowerBound: 0
+          ScalingAdjustment: -1
+
+  CPUAlarmHigh:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      EvaluationPeriods: 5
+      Statistic: Average
+      Threshold: 70
+      AlarmDescription: "Scale out if CPU > 70% for 5 minutes"
+      Period: 60
+      AlarmActions:
+        - !Ref ASGScalingPolicyHigh
+      Namespace: AWS/EC2
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref WebServerGroup
+      ComparisonOperator: GreaterThanThreshold
+      MetricName: CPUUtilization
+  CPUAlarmDown:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      EvaluationPeriods: 5
+      Statistic: Average
+      Threshold: 30
+      AlarmDescription: "Scale in if CPU < 30% for 5 minutes"
+      Period: 60
+      AlarmActions:
+        - !Ref ASGScalingPolicyDown
+      Namespace: AWS/EC2
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref WebServerGroup
+      ComparisonOperator: LessThanThreshold
+      MetricName: CPUUtilization
+
+  DBInstance:
+    Type: "AWS::RDS::DBInstance"
+    Properties:
+      DBName: !Ref DBName
+      Engine: MySQL
+      MultiAZ: "true"
+      MasterUsername: !Ref DBUser
+      MasterUserPassword: !Ref DBPassword
+      DBInstanceClass: db.t2.small
+      AllocatedStorage: "5"
+      VPCSecurityGroups:
+        - !GetAtt DBEC2SecurityGroup.GroupId
+      DBSubnetGroupName: !Ref DBSubnetGroup
+
+Outputs:
+  WebsiteURL:
+    Value: !Join ["", ["http://", !GetAtt ElasticLoadBalancer.DNSName]]
+    Description: Elastic Load Balancer DNS Name
+  ClodFrontURL:
+    Value: !Join ["", ["https://", !GetAtt CFDistribution.DomainName]]
+    Description: CF Distribution
